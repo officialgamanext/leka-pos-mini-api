@@ -519,10 +519,14 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
     const billsRef = db.collection(`users/${userId}/businesses/${businessId}/bills`);
     const invRef   = db.collection(`users/${userId}/businesses/${businessId}/investments`);
 
-    const [billsSnap, invSnap] = await Promise.all([
+    const [billsSnap, invSnap, itemsSnap] = await Promise.all([
       billsRef.where("createdAt", ">=", start).where("createdAt", "<=", end).get(),
-      invRef.where("date", ">=", start).where("date", "<=", end).get()
+      invRef.where("date", ">=", start).where("date", "<=", end).get(),
+      db.collection(`users/${userId}/businesses/${businessId}/items`).get()
     ]);
+
+    const itemsMap = {};
+    itemsSnap.forEach(doc => { itemsMap[doc.id] = doc.data().name || "Unknown Item"; });
 
     // ── Aggregate Bills ──────────────────────────────────────────
     let totalRevenue = 0;
