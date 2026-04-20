@@ -265,7 +265,7 @@ app.get("/api/categories", authMiddleware, async (req, res) => {
 
 app.post("/api/item", authMiddleware, async (req, res) => {
   try {
-    const { businessId, name, price, categoryId } = req.body;
+    const { businessId, name, price, categoryId, imageUrl } = req.body;
     const userId = req.user.userId;
     if (!businessId || !name || price === undefined) {
       return res.status(400).json({ error: "businessId, name, and price are required" });
@@ -276,6 +276,7 @@ app.post("/api/item", authMiddleware, async (req, res) => {
       name,
       price: parseFloat(price),
       categoryId: categoryId || null,
+      imageUrl: imageUrl || null,
       createdAt: FieldValue.serverTimestamp()
     });
     res.status(201).json({ id: doc.id, message: "Item created" });
