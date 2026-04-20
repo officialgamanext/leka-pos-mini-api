@@ -331,7 +331,7 @@ app.get("/api/items", authMiddleware, async (req, res) => {
 
 app.post("/api/bill", authMiddleware, async (req, res) => {
   try {
-    const { businessId, items, total, discount = 0, tax = 0, paymentMethod = "cash" } = req.body;
+    const { businessId, items, total, discount = 0, tax = 0, paymentMode = "Cash", paymentMethod } = req.body;
     const userId = req.user.userId;
     if (!businessId || !items || total === undefined) {
       return res.status(400).json({ error: "businessId, items, and total are required" });
@@ -343,7 +343,7 @@ app.post("/api/bill", authMiddleware, async (req, res) => {
       total: parseFloat(total),
       discount: parseFloat(discount),
       tax: parseFloat(tax),
-      paymentMethod,
+      paymentMode: paymentMode !== "Cash" ? paymentMode : (paymentMethod || "Cash"),
       createdAt: FieldValue.serverTimestamp()
     });
     res.status(201).json({ id: doc.id, message: "Bill created" });
@@ -531,6 +531,7 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
     // ── Aggregate Bills ──────────────────────────────────────────
     let totalRevenue = 0;
     let totalBills = 0;
+    const paymentModes = { Cash: 0, UPI: 0, Card: 0 };
     const itemSales = {};          // { itemName: { qty, revenue } }
     const dailyRevMap = {};        // { "2024-04-20": number }
     const weeklyRevMap = {};       // { "2024-W16": number }
@@ -543,6 +544,13 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
 
       totalRevenue += amt;
       totalBills++;
+
+      const pMode = d.paymentMode || "Cash";
+      if (paymentModes[pMode] !== undefined) {
+        paymentModes[pMode] += amt;
+      } else {
+        paymentModes[pMode] = (paymentModes[pMode] || 0) + amt;
+      }
 
       const dayKey     = format(billDate, "yyyy-MM-dd");
       const weekKey    = format(billDate, "yyyy-'W'II");
@@ -617,7 +625,8 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
         isProfit,
         profitLossPct: parseFloat(profitLossPct.toFixed(2)),
         totalBills,
-        avgOrderValue: totalBills > 0 ? parseFloat((totalRevenue / totalBills).toFixed(2)) : 0
+        avgOrderValue: totalBills > 0 ? parseFloat((totalRevenue / totalBills).toFixed(2)) : 0,
+        paymentModes
       },
       charts: {
         daily:   dailyChart,
