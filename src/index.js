@@ -551,7 +551,9 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
       // Top items
       if (Array.isArray(d.items)) {
         d.items.forEach(item => {
-          const key = item.name || "Unknown";
+          let key = item.name;
+          if (!key) key = itemsMap[item.itemId] || "Unknown Item";
+
           if (!itemSales[key]) itemSales[key] = { qty: 0, revenue: 0 };
           itemSales[key].qty     += item.quantity || 1;
           itemSales[key].revenue += (item.price || 0) * (item.quantity || 1);
@@ -655,9 +657,14 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
       .orderBy("createdAt", "desc")
       .get();
 
+    const itemsSnap = await db.collection(`users/${userId}/businesses/${businessId}/items`).get();
+    const itemsMap = {};
+    itemsSnap.forEach(doc => { itemsMap[doc.id] = doc.data().name || "Unknown Item"; });
+
     let totalRevenue = 0;
     let totalBills = 0;
     const salesByCategory = {};
+    const itemSales = {}; // New: Track individual item sales
     const bills = [];
 
     snap.forEach(doc => {
@@ -667,8 +674,22 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
 
       if (Array.isArray(d.items)) {
         d.items.forEach(item => {
+          const qty = item.quantity || 1;
+          const itemRevenue = (item.price || 0) * qty;
+
+          // Category aggregation
           const cat = item.categoryId || "Uncategorized";
-          salesByCategory[cat] = (salesByCategory[cat] || 0) + (item.price * (item.quantity || 1));
+          salesByCategory[cat] = (salesByCategory[cat] || 0) + itemRevenue;
+
+          // Item aggregation
+          let itemName = item.name;
+          if (!itemName) itemName = itemsMap[item.itemId] || "Unknown Item";
+
+          if (!itemSales[itemName]) {
+            itemSales[itemName] = { qty: 0, revenue: 0 };
+          }
+          itemSales[itemName].qty += qty;
+          itemSales[itemName].revenue += itemRevenue;
         });
       }
 
@@ -679,12 +700,18 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
       });
     });
 
+    // Convert itemSales object to sorted array
+    const sortedItemSales = Object.entries(itemSales)
+      .map(([name, stats]) => ({ name, ...stats }))
+      .sort((a, b) => b.revenue - a.revenue); // Sort by highest revenue
+
     res.status(200).json({
       summary: {
         totalRevenue,
         totalBills,
         averageOrderValue: totalBills > 0 ? parseFloat((totalRevenue / totalBills).toFixed(2)) : 0,
-        salesByCategory
+        salesByCategory,
+        itemSales: sortedItemSales // Added to response
       },
       range: { start: start.toISOString(), end: end.toISOString(), type: range },
       bills: bills.slice(0, 200)
