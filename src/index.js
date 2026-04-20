@@ -5,6 +5,13 @@ import { db, FieldValue } from "./config/firebase.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { getDateRange } from "./helpers/dateRange.js";
 import { format } from "date-fns";
+import ImageKit from "imagekit";
+
+const imagekit = new ImageKit({
+  publicKey: process.env.IMAGEKIT_PUBLIC_KEY || "your_public_key",
+  privateKey: process.env.IMAGEKIT_PRIVATE_KEY || "your_private_key",
+  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || "https://ik.imagekit.io/your_imagekit_id"
+});
 
 dotenv.config();
 
@@ -271,15 +278,32 @@ app.post("/api/item", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "businessId, name, and price are required" });
     }
 
+    let finalImageUrl = imageUrl || null;
+
+    if (finalImageUrl && finalImageUrl.startsWith("data:image")) {
+      try {
+        const uploadResult = await imagekit.upload({
+          file: finalImageUrl, 
+          fileName: `item_${Date.now()}.jpg`,
+          folder: "/leka-pos-mini"
+        });
+        finalImageUrl = uploadResult.url; 
+      } catch (uploadErr) {
+        console.error("ImageKit Upload Error:", uploadErr);
+        // Depending on your requirements, you might want to return an error here
+        // return res.status(500).json({ error: "Failed to upload image" });
+      }
+    }
+
     const ref = db.collection(`users/${userId}/businesses/${businessId}/items`);
     const doc = await ref.add({
       name,
       price: parseFloat(price),
       categoryId: categoryId || null,
-      imageUrl: imageUrl || null,
+      imageUrl: finalImageUrl,
       createdAt: FieldValue.serverTimestamp()
     });
-    res.status(201).json({ id: doc.id, message: "Item created" });
+    res.status(201).json({ id: doc.id, message: "Item created", imageUrl: finalImageUrl });
   } catch (err) {
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
