@@ -943,6 +943,10 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
 
 app.get("/health", (_, res) => res.send("OK"));
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+export default app;
+
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+  });
+}
