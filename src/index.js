@@ -23,7 +23,11 @@ const imagekit = new ImageKit({
 // Initialize Cache (Path cache: 5 mins, Data cache: 5 mins)
 const apiCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PATCH", "DELETE", "PUT", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"]
+}));
 app.use(express.json());
 
 // Cache Helpers
@@ -1008,6 +1012,247 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ADMIN AREA (Super Admin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Simple development admin bypass or secret key check
+const adminAuth = (req, res, next) => {
+  // TEMPORARILY DISABLED FOR DEBUGGING
+  return next();
+};
+
+app.get("/api/admin/discover", adminAuth, async (req, res) => {
+  try {
+    const rootCols = (await db.listCollections()).map(c => c.id);
+    const someUsers = await db.collection("users").limit(10).get();
+    const userInspection = [];
+    
+    for (const userDoc of someUsers.docs) {
+      const subs = (await userDoc.ref.listCollections()).map(c => c.id);
+      userInspection.push({
+        id: userDoc.id,
+        email: userDoc.data().email || userDoc.data().name,
+        subCollections: subs
+      });
+    }
+
+    const usersCount = (await db.collection("users").count().get()).data().count;
+    const bizGroupCount = (await db.collectionGroup("businesses").count().get()).data().count;
+    
+    res.json({ 
+      v: "1.0.6",
+      usersInDb: usersCount,
+      businessesInDb: bizGroupCount,
+      rootCollections: rootCols, 
+      users: userInspection
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * GET /api/admin/users — List all users (Discovering from businesses if root docs are missing)
+ */
+app.get("/api/admin/users", adminAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    
+    // 1. Get explicit users
+    const usersSnap = await db.collection("users").get();
+    const userMap = new Map();
+    usersSnap.forEach(doc => userMap.set(doc.id, { id: doc.id, ...doc.data() }));
+
+    // 2. Discover users from businesses
+    const bizSnap = await db.collectionGroup("businesses").get();
+    bizSnap.forEach(doc => {
+      const ownerId = doc.ref.parent.parent.id;
+      if (!userMap.has(ownerId)) {
+        userMap.set(ownerId, { 
+          id: ownerId, 
+          name: doc.data().ownerMobile || "Unknown Owner",
+          phoneNumber: doc.data().ownerMobile,
+          isVirtual: true 
+        });
+      }
+    });
+
+    const allUsers = Array.from(userMap.values());
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const paginated = allUsers.slice(offset, offset + parseInt(limit));
+
+    res.status(200).json({
+      users: paginated,
+      pagination: {
+        total: allUsers.length,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(allUsers.length / limit)
+      }
+    });
+  } catch (err) {
+    console.error("Admin: Error fetching users:", err);
+    res.status(500).json({ error: "Internal server error", message: err.message });
+  }
+});
+
+/**
+ * DELETE /api/admin/user/:userId
+ */
+app.delete("/api/admin/user/:userId", adminAuth, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    // Note: In production, you'd also delete subcollections recursively.
+    await db.doc(`users/${userId}`).delete();
+    res.status(200).json({ message: "User deleted" });
+  } catch (err) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * GET /api/admin/businesses — List all businesses across all users
+ */
+app.get("/api/admin/businesses", adminAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    const bizSnap = await db.collectionGroup("businesses")
+      // .orderBy("createdAt", "desc") // requires index for collection group
+      .limit(parseInt(limit))
+      // .offset(offset) // offset is inefficient for large datasets, but ok for now
+      .get();
+
+    const businesses = [];
+    bizSnap.forEach(doc => {
+      const data = doc.data();
+      businesses.push({
+        id: doc.id,
+        ownerId: doc.ref.parent.parent.id,
+        ...data,
+        createdAt: data.createdAt ? (data.createdAt.toDate ? data.createdAt.toDate().toISOString() : data.createdAt) : null
+      });
+    });
+
+    res.status(200).json(businesses);
+  } catch (err) {
+    console.error("Admin: Error fetching businesses:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * GET /api/admin/business/:ownerId/:bizId/details
+ */
+app.get("/api/admin/business/:ownerId/:bizId/details", adminAuth, async (req, res) => {
+  try {
+    const { ownerId, bizId } = req.params;
+    const bizRef = db.doc(`users/${ownerId}/businesses/${bizId}`);
+    const bizSnap = await bizRef.get();
+
+    if (!bizSnap.exists) return res.status(404).json({ error: "Business not found" });
+
+    const [billsSnap, itemsSnap, catsSnap, staffSnap] = await Promise.all([
+      db.collection(`users/${ownerId}/businesses/${bizId}/bills`).limit(50).get(),
+      db.collection(`users/${ownerId}/businesses/${bizId}/items`).get(),
+      db.collection(`users/${ownerId}/businesses/${bizId}/categories`).get(),
+      db.collection(`users/${ownerId}/businesses/${bizId}/staff`).get()
+    ]);
+
+    const bills = [];
+    billsSnap.forEach(doc => bills.push({ id: doc.id, ...doc.data(), createdAt: doc.data().createdAt?.toDate().toISOString() }));
+
+    const items = [];
+    itemsSnap.forEach(doc => items.push({ id: doc.id, ...doc.data() }));
+
+    const categories = [];
+    catsSnap.forEach(doc => categories.push({ id: doc.id, ...doc.data() }));
+
+    const staff = [];
+    staffSnap.forEach(doc => staff.push({ id: doc.id, ...doc.data() }));
+
+    const bizData = bizSnap.data();
+    if (bizData.expiryDate && bizData.expiryDate.toDate) {
+      bizData.expiryDate = bizData.expiryDate.toDate().toISOString();
+    } else if (bizData.expiryDate && bizData.expiryDate._seconds) {
+      // Handle raw timestamp object if necessary
+      bizData.expiryDate = new Date(bizData.expiryDate._seconds * 1000).toISOString();
+    }
+
+    res.status(200).json({
+      info: { id: bizId, ownerId, ...bizData },
+      bills,
+      items,
+      categories,
+      staff
+    });
+  } catch (err) {
+    console.error("Admin: Error fetching business details:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * PATCH /api/admin/business/:ownerId/:bizId
+ */
+app.patch("/api/admin/business/:ownerId/:bizId", adminAuth, async (req, res) => {
+  try {
+    const { ownerId, bizId } = req.params;
+    const updates = req.body;
+    delete updates.id;
+    delete updates.ownerId;
+    
+    if (updates.expiryDate) {
+      updates.expiryDate = new Date(updates.expiryDate);
+    }
+
+    await db.doc(`users/${ownerId}/businesses/${bizId}`).update({
+      ...updates,
+      updatedAt: FieldValue.serverTimestamp()
+    });
+
+    res.status(200).json({ message: "Business updated" });
+  } catch (err) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * DELETE /api/admin/business/:ownerId/:bizId
+ */
+app.delete("/api/admin/business/:ownerId/:bizId", adminAuth, async (req, res) => {
+  try {
+    const { ownerId, bizId } = req.params;
+    await db.doc(`users/${ownerId}/businesses/${bizId}`).delete();
+    res.status(200).json({ message: "Business deleted" });
+  } catch (err) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * GET /api/admin/all-staff
+ */
+app.get("/api/admin/all-staff", adminAuth, async (req, res) => {
+  try {
+    const staffSnap = await db.collectionGroup("staff").get();
+    const staff = [];
+    staffSnap.forEach(doc => {
+      staff.push({
+        id: doc.id,
+        businessId: doc.ref.parent.parent.id,
+        ownerId: doc.ref.parent.parent.parent.parent.id,
+        ...doc.data()
+      });
+    });
+    res.status(200).json(staff);
+  } catch (err) {
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  HEALTH
