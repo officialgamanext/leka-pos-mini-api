@@ -23,10 +23,22 @@ export const authMiddleware = async (req, res, next) => {
     // Validate session token
     const authInfo = await descopeClient.validateSession(token);
     
-    // Descope returns session information including user ID (sub)
-    // We attach it to the request object for use in routes
+    const userId = authInfo.token.sub;
+    let phoneNumber = authInfo.token.phoneNumber || authInfo.token.phone || authInfo.token.phone_number;
+
+    // If phone is missing from token, fetch it from Descope User Management
+    if (!phoneNumber) {
+      try {
+        const userResponse = await descopeClient.management.user.load(userId);
+        phoneNumber = userResponse.data.phone;
+      } catch (err) {
+        console.error("[Auth] Failed to fetch user details from Descope:", err);
+      }
+    }
+
     req.user = {
-      userId: authInfo.token.sub,
+      userId,
+      phoneNumber,
       ...authInfo.token
     };
     

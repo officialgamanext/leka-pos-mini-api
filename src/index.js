@@ -30,55 +30,92 @@ app.use(express.json());
  *  Owners:  users/{ownerId}/businesses/{businessId}
  *  Staff :  same path but the ownerId is stored in the business doc
  */
-async function resolveBusinessPath(userId, businessId) {
-  // Check if user owns it
+/** Resolve the Firestore path for a business. */
+async function resolveBusinessPath(userId, userMobile, businessId) {
+  // 1. Check if user owns it
   const ownerRef = db.doc(`users/${userId}/businesses/${businessId}`);
   const ownerSnap = await ownerRef.get();
   if (ownerSnap.exists) return { ownerId: userId, businessId };
 
-  // Check if user is a staff member on any business
-  const staffSnap = await db.collectionGroup("staff")
-    .where("userId", "==", userId)
-    .where("businessId", "==", businessId)
-    .limit(1)
-    .get();
+  // 2. Check if user is a staff member by mobile number (flexible)
+  if (!userMobile) return null;
+  const cleanLogged = userMobile.replace(/\D/g, "");
+  const last10 = cleanLogged.slice(-10);
 
-  if (!staffSnap.empty) {
-    const staffDoc = staffSnap.docs[0];
-    const ownerId = staffDoc.ref.parent.parent.parent.parent.id; // users/{ownerId}/businesses/{bId}/staff/{docId}
-    return { ownerId, businessId };
+  // Search all staff records in the system
+  const staffSnap = await db.collectionGroup("staff").get();
+  for (const staffDoc of staffSnap.docs) {
+    const sData = staffDoc.data();
+    const sMobile = (sData.mobileNumber || "").replace(/\D/g, "");
+    
+    // Check if both businessId and mobile number match
+    if (sData.businessId === businessId && sMobile.endsWith(last10)) {
+      const ownerId = staffDoc.ref.parent.parent.parent.parent.id;
+      return { ownerId, businessId };
+    }
   }
 
   return null;
 }
 
 /** Return all businesses visible to a user (own + as staff) */
-async function getAccessibleBusinesses(userId) {
+async function getAccessibleBusinesses(userId, userMobile) {
   const results = [];
+  console.log(`[Discovery] Checking businesses for User: ${userId}, Mobile: ${userMobile}`);
 
   // 1. Own businesses
   const ownSnap = await db.collection(`users/${userId}/businesses`).get();
-  ownSnap.forEach(doc => {
-    results.push({ id: doc.id, ...doc.data(), role: "owner" });
-  });
+  console.log(`[Discovery] Found ${ownSnap.size} owned businesses`);
+  
+  for (const doc of ownSnap.docs) {
+    const bizData = doc.data();
+    const staffSnap = await db.collection(`users/${userId}/businesses/${doc.id}/staff`).get();
+    const staffList = [];
+    staffSnap.forEach(s => staffList.push({ id: s.id, ...s.data() }));
 
-  // 2. Businesses where user is staff
-  const staffSnap = await db.collectionGroup("staff")
-    .where("userId", "==", userId)
-    .get();
+    results.push({ 
+      id: doc.id, 
+      ...bizData, 
+      role: "owner",
+      staffList
+    });
+  }
 
-  const staffBizPromises = staffSnap.docs.map(async (staffDoc) => {
-    // Path: users/{ownerId}/businesses/{bId}/staff/{staffId}
-    const bizRef = staffDoc.ref.parent.parent;
-    const bizSnap = await bizRef.get();
-    if (bizSnap.exists) {
-      return { id: bizSnap.id, ...bizSnap.data(), role: staffDoc.data().role || "staff" };
+  // 2. Businesses where user is staff by mobile number
+  if (userMobile) {
+    // Extract last 10 digits to be safe from +91 or other prefix issues
+    const cleanMobile = userMobile.replace(/\D/g, "");
+    const last10 = cleanMobile.slice(-10);
+    
+    console.log(`[Discovery] Searching for staff entries matching last 10 digits: ${last10}`);
+
+    const staffSnap = await db.collectionGroup("staff").get();
+    console.log(`[Discovery] Total staff records in system: ${staffSnap.size}`);
+
+    for (const staffDoc of staffSnap.docs) {
+      const sData = staffDoc.data();
+      const sMobile = (sData.mobileNumber || "").replace(/\D/g, "");
+      
+      // If the last 10 digits match, treat as the same person
+      if (sMobile.endsWith(last10)) {
+        const bizRef = staffDoc.ref.parent.parent;
+        const bizSnap = await bizRef.get();
+        
+        if (bizSnap.exists) {
+          console.log(`[Discovery] Found staff Match! Business: ${bizSnap.data().name}`);
+          const ownerId = bizRef.parent.parent.id;
+          const ownerSnap = await db.doc(`users/${ownerId}`).get();
+          
+          results.push({ 
+            id: bizSnap.id, 
+            ...bizSnap.data(), 
+            role: sData.role || "staff",
+            ownerMobile: ownerSnap.exists ? ownerSnap.data().phoneNumber : null
+          });
+        }
+      }
     }
-    return null;
-  });
-
-  const staffBizResults = (await Promise.all(staffBizPromises)).filter(Boolean);
-  results.push(...staffBizResults);
+  }
 
   return results;
 }
@@ -97,14 +134,20 @@ app.post("/api/business", authMiddleware, async (req, res) => {
     if (!name) return res.status(400).json({ error: "Business name is required" });
 
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber;
+
     const businessRef = db.collection(`users/${userId}/businesses`);
     const newBusiness = await businessRef.add({
       name,
       ownerId: userId,
+      ownerMobile: userMobile,
       createdAt: FieldValue.serverTimestamp()
     });
 
-    res.status(201).json({ id: newBusiness.id, name, role: "owner", message: "Business created successfully" });
+    // Also update user profile with phone if not there
+    await db.doc(`users/${userId}`).set({ phoneNumber: userMobile }, { merge: true });
+
+    res.status(201).json({ id: newBusiness.id, name, role: "owner", message: "Business created" });
   } catch (err) {
     console.error("Error creating business:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
@@ -113,12 +156,14 @@ app.post("/api/business", authMiddleware, async (req, res) => {
 
 /**
  * GET /api/businesses  — List all businesses (owned + staff)
- * Response includes { role: "owner" | "staff" | "manager" } per business
  */
 app.get("/api/businesses", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const businesses = await getAccessibleBusinesses(userId);
+    // Handle different possible field names for phone from Descope
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
+    
+    const businesses = await getAccessibleBusinesses(userId, userMobile);
     res.status(200).json(businesses);
   } catch (err) {
     console.error("Error fetching businesses:", err);
@@ -132,47 +177,42 @@ app.get("/api/businesses", authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * POST /api/staff  — Add a staff member to a business
- * Body: { businessId, staffUserId, role }
- * Only the owner can add staff.
+ * POST /api/staff  — Add a staff member by Mobile Number
+ * Body: { businessId, mobileNumber, name, role }
  */
 app.post("/api/staff", authMiddleware, async (req, res) => {
   try {
-    const { businessId, staffUserId, role = "staff" } = req.body;
-    const userId = req.user.userId; // must be the owner
+    const { businessId, mobileNumber, name, role = "staff" } = req.body;
+    const userId = req.user.userId;
 
-    if (!businessId || !staffUserId) {
-      return res.status(400).json({ error: "businessId and staffUserId are required" });
+    if (!businessId || !mobileNumber || !name) {
+      return res.status(400).json({ error: "businessId, mobileNumber, and name are required" });
     }
 
     // Verify ownership
     const bizRef = db.doc(`users/${userId}/businesses/${businessId}`);
     const bizSnap = await bizRef.get();
     if (!bizSnap.exists) {
-      return res.status(403).json({ error: "Not authorised: you do not own this business" });
-    }
-
-    const validRoles = ["staff", "manager"];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({ error: `Invalid role. Must be one of: ${validRoles.join(", ")}` });
+      return res.status(403).json({ error: "Only business owners can add staff" });
     }
 
     const staffRef = db.collection(`users/${userId}/businesses/${businessId}/staff`);
 
-    // Prevent duplicate
-    const existing = await staffRef.where("userId", "==", staffUserId).limit(1).get();
+    // Check if duplicate mobile in this business
+    const existing = await staffRef.where("mobileNumber", "==", mobileNumber).limit(1).get();
     if (!existing.empty) {
-      return res.status(409).json({ error: "This user is already a staff member" });
+      return res.status(409).json({ error: "This mobile number is already added as staff" });
     }
 
     const newStaff = await staffRef.add({
-      userId: staffUserId,
+      mobileNumber,
+      name,
       businessId,
       role,
       addedAt: FieldValue.serverTimestamp()
     });
 
-    res.status(201).json({ id: newStaff.id, message: "Staff member added successfully" });
+    res.status(201).json({ id: newStaff.id, message: "Staff added" });
   } catch (err) {
     console.error("Error adding staff:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
@@ -240,9 +280,13 @@ app.post("/api/category", authMiddleware, async (req, res) => {
   try {
     const { businessId, name } = req.body;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
     if (!businessId || !name) return res.status(400).json({ error: "businessId and name are required" });
 
-    const ref = db.collection(`users/${userId}/businesses/${businessId}/categories`);
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
+
+    const ref = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`);
     const doc = await ref.add({ name, createdAt: FieldValue.serverTimestamp() });
     res.status(201).json({ id: doc.id, message: "Category created" });
   } catch (err) {
@@ -254,9 +298,13 @@ app.get("/api/categories", authMiddleware, async (req, res) => {
   try {
     const { businessId } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
 
-    const snap = await db.collection(`users/${userId}/businesses/${businessId}/categories`).get();
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
+
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`).get();
     const data = [];
     snap.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
     res.status(200).json(data);
@@ -274,9 +322,14 @@ app.post("/api/item", authMiddleware, async (req, res) => {
   try {
     const { businessId, name, price, categoryId, imageUrl } = req.body;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
+
     if (!businessId || !name || price === undefined) {
       return res.status(400).json({ error: "businessId, name, and price are required" });
     }
+
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
 
     let finalImageUrl = imageUrl || null;
 
@@ -290,12 +343,10 @@ app.post("/api/item", authMiddleware, async (req, res) => {
         finalImageUrl = uploadResult.url; 
       } catch (uploadErr) {
         console.error("ImageKit Upload Error:", uploadErr);
-        // Depending on your requirements, you might want to return an error here
-        // return res.status(500).json({ error: "Failed to upload image" });
       }
     }
 
-    const ref = db.collection(`users/${userId}/businesses/${businessId}/items`);
+    const ref = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`);
     const doc = await ref.add({
       name,
       price: parseFloat(price),
@@ -313,9 +364,13 @@ app.get("/api/items", authMiddleware, async (req, res) => {
   try {
     const { businessId } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
 
-    const snap = await db.collection(`users/${userId}/businesses/${businessId}/items`).get();
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
+
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`).get();
     const data = [];
     snap.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
     res.status(200).json(data);
@@ -333,11 +388,16 @@ app.post("/api/bill", authMiddleware, async (req, res) => {
   try {
     const { businessId, items, total, discount = 0, tax = 0, paymentMode = "Cash", paymentMethod } = req.body;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
+
     if (!businessId || !items || total === undefined) {
       return res.status(400).json({ error: "businessId, items, and total are required" });
     }
 
-    const ref = db.collection(`users/${userId}/businesses/${businessId}/bills`);
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
+
+    const ref = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/bills`);
     const doc = await ref.add({
       items,
       total: parseFloat(total),
@@ -356,12 +416,17 @@ app.get("/api/bills", authMiddleware, async (req, res) => {
   try {
     const { businessId, range = "today", startDate, endDate, limit: limitParam } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
+
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
+
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
 
     const { start, end } = getDateRange(range, startDate, endDate);
     const pageLimit = Math.min(parseInt(limitParam) || 50, 200);
 
-    const snap = await db.collection(`users/${userId}/businesses/${businessId}/bills`)
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/bills`)
       .where("createdAt", ">=", start)
       .where("createdAt", "<=", end)
       .orderBy("createdAt", "desc")
@@ -397,14 +462,18 @@ app.post("/api/investment", authMiddleware, async (req, res) => {
   try {
     const { businessId, title, amount, category = "General", note = "", date } = req.body;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
 
     if (!businessId || !title || amount === undefined) {
       return res.status(400).json({ error: "businessId, title, and amount are required" });
     }
 
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
+
     const investmentDate = date ? new Date(date) : new Date();
 
-    const ref = db.collection(`users/${userId}/businesses/${businessId}/investments`);
+    const ref = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/investments`);
     const doc = await ref.add({
       title,
       amount: parseFloat(amount),
@@ -427,11 +496,15 @@ app.get("/api/investments", authMiddleware, async (req, res) => {
   try {
     const { businessId, range = "thisMonth", startDate, endDate } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
+
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
 
     const { start, end } = getDateRange(range, startDate, endDate);
 
-    const snap = await db.collection(`users/${userId}/businesses/${businessId}/investments`)
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/investments`)
       .where("date", ">=", start)
       .where("date", "<=", end)
       .orderBy("date", "desc")
@@ -470,9 +543,13 @@ app.delete("/api/investment/:id", authMiddleware, async (req, res) => {
     const { id } = req.params;
     const { businessId } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
 
-    await db.doc(`users/${userId}/businesses/${businessId}/investments/${id}`).delete();
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
+
+    await db.doc(`users/${path.ownerId}/businesses/${path.businessId}/investments/${id}`).delete();
     res.status(200).json({ message: "Investment deleted" });
   } catch (err) {
     res.status(500).json({ error: "Internal server error", message: err.message });
@@ -503,8 +580,12 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
   try {
     const { businessId, range = "today", startDate, endDate } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
 
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
+
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
 
     let dateRange;
     try {
@@ -516,13 +597,13 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
     const { start, end } = dateRange;
 
     // Fetch bills and investments in parallel
-    const billsRef = db.collection(`users/${userId}/businesses/${businessId}/bills`);
-    const invRef   = db.collection(`users/${userId}/businesses/${businessId}/investments`);
+    const billsRef = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/bills`);
+    const invRef   = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/investments`);
 
     const [billsSnap, invSnap, itemsSnap] = await Promise.all([
       billsRef.where("createdAt", ">=", start).where("createdAt", "<=", end).get(),
       invRef.where("date", ">=", start).where("date", "<=", end).get(),
-      db.collection(`users/${userId}/businesses/${businessId}/items`).get()
+      db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`).get()
     ]);
 
     const itemsMap = {};
@@ -656,7 +737,11 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
   try {
     const { businessId, range = "today", startDate, endDate } = req.query;
     const userId = req.user.userId;
+    const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
     if (!businessId) return res.status(400).json({ error: "businessId is required" });
+
+    const path = await resolveBusinessPath(userId, userMobile, businessId);
+    if (!path) return res.status(403).json({ error: "Not authorised" });
 
     let dr;
     try { dr = getDateRange(range, startDate, endDate); }
@@ -664,13 +749,13 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
 
     const { start, end } = dr;
 
-    const snap = await db.collection(`users/${userId}/businesses/${businessId}/bills`)
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/bills`)
       .where("createdAt", ">=", start)
       .where("createdAt", "<=", end)
       .orderBy("createdAt", "desc")
       .get();
 
-    const itemsSnap = await db.collection(`users/${userId}/businesses/${businessId}/items`).get();
+    const itemsSnap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`).get();
     const itemsMap = {};
     itemsSnap.forEach(doc => { itemsMap[doc.id] = doc.data().name || "Unknown Item"; });
 
