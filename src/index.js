@@ -249,6 +249,43 @@ app.get("/api/businesses", authMiddleware, async (req, res) => {
   }
 });
 
+/**
+ * PATCH /api/business/:businessId — Update business details (address, gst, etc.)
+ */
+app.patch("/api/business/:businessId", authMiddleware, async (req, res) => {
+  try {
+    const { businessId } = req.params;
+    const { name, address, gstEnabled, gstPercentage } = req.body;
+    const userId = req.user.userId;
+
+    const bizRef = db.doc(`users/${userId}/businesses/${businessId}`);
+    const bizSnap = await bizRef.get();
+    
+    if (!bizSnap.exists) {
+      return res.status(404).json({ error: "Business not found or access denied" });
+    }
+
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (address !== undefined) updates.address = address;
+    if (gstEnabled !== undefined) updates.gstEnabled = gstEnabled;
+    if (gstPercentage !== undefined) updates.gstPercentage = Number(gstPercentage);
+    
+    updates.updatedAt = FieldValue.serverTimestamp();
+
+    await bizRef.update(updates);
+    
+    // Clear cache so UI sees new name/status
+    apiCache.del(`path_${userId}_${businessId}`);
+
+    res.status(200).json({ message: "Business updated successfully", updates });
+  } catch (err) {
+    console.error("Error updating business:", err);
+    res.status(500).json({ error: "Internal server error", message: err.message });
+  }
+});
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STAFF MANAGEMENT
