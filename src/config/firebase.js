@@ -17,19 +17,24 @@ if (!admin.apps.length) {
     let serviceAccount;
 
     // 1. Check for individual environment variables (Best for Vercel/Production)
-    if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-      // Deep Clean: Handle both literal \n and actual newlines
-      const rawKey = process.env.FIREBASE_PRIVATE_KEY;
-      const formattedKey = rawKey
-        .replace(/^["']|["']$/g, '') // Remove quotes
-        .replace(/\\n/g, '\n');      // Fix escaped newlines
+    if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && (process.env.FIREBASE_PRIVATE_KEY || process.env.FIREBASE_PRIVATE_KEY_BASE64)) {
+      let key = process.env.FIREBASE_PRIVATE_KEY || "";
+      
+      // DEPLOYMENT FIX: Support Base64 encoding to avoid PEM format errors on Vercel
+      if (process.env.FIREBASE_PRIVATE_KEY_BASE64) {
+        key = Buffer.from(process.env.FIREBASE_PRIVATE_KEY_BASE64, 'base64').toString('utf8');
+        console.log("🛠️ Using FIREBASE_PRIVATE_KEY_BASE64 (Most Secure)");
+      } else {
+        // Deep Clean for raw PEM strings
+        key = key.replace(/^["']|["']$/g, '').replace(/\\n/g, '\n');
+        console.log("🛠️ Using raw FIREBASE_PRIVATE_KEY (Standard Fix)");
+      }
       
       serviceAccount = {
         projectId: process.env.FIREBASE_PROJECT_ID,
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: formattedKey
+        privateKey: key
       };
-      console.log("🛠️ Using individual Firebase Env Vars (Concentrated Fix)");
     } 
     // 2. Fallback to full JSON string
     else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
