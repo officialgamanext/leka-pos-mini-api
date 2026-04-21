@@ -16,11 +16,25 @@ if (!admin.apps.length) {
   try {
     let serviceAccount;
 
-    // Use environment variable if available (Recommended for Vercel)
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // 1. Check for individual environment variables (Best for Vercel/Production)
+    if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+      serviceAccount = {
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+      };
+      console.log("🛠️ Using individual Firebase Env Vars");
+    } 
+    // 2. Fallback to full JSON string
+    else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
       serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    } else {
-      // Fallback for local development
+      if (serviceAccount.private_key) {
+        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+      }
+      console.log("🛠️ Using full FIREBASE_SERVICE_ACCOUNT JSON");
+    } 
+    // 3. Fallback to local file
+    else {
       const certPath = path.resolve(__dirname, "../../service-account.json");
       if (fs.existsSync(certPath)) {
         serviceAccount = JSON.parse(fs.readFileSync(certPath, "utf8"));
@@ -28,12 +42,7 @@ if (!admin.apps.length) {
     }
 
     if (!serviceAccount) {
-      throw new Error("Firebase Service Account configuration missing.");
-    }
-
-    // Fix private key formatting for Vercel
-    if (serviceAccount.private_key) {
-      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+      throw new Error("Firebase Service Account configuration missing. Please set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY.");
     }
 
     admin.initializeApp({
