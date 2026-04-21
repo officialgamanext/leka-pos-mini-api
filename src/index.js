@@ -122,46 +122,67 @@ async function resolveBusinessPath(userId, userMobile, businessId) {
 /** Return all businesses visible to a user (own + as staff) */
 async function getAccessibleBusinesses(userId, userMobile) {
   const results = [];
+  console.log(`[Discovery] Fetching for User: ${userId}, Mobile: ${userMobile}`);
 
   // 1. Own businesses
-  const ownSnap = await db.collection(`users/${userId}/businesses`).get();
-  for (const doc of ownSnap.docs) {
-    const bizData = doc.data();
-    // Check expiry for UI label
-    const isExpired = bizData.expiryDate ? bizData.expiryDate.toDate() < new Date() : true;
+  try {
+    const ownSnap = await db.collection(`users/${userId}/businesses`).get();
+    for (const doc of ownSnap.docs) {
+      const bizData = doc.data();
+      // Check expiry for UI label (Safe check)
+      let isExpired = true;
+      try {
+        if (bizData.expiryDate) {
+          const exp = bizData.expiryDate.toDate ? bizData.expiryDate.toDate() : new Date(bizData.expiryDate);
+          isExpired = exp < new Date();
+        }
+      } catch (e) { console.error(`[DateFix] Bad date for ${doc.id}`); }
 
-    results.push({ 
-      id: doc.id, 
-      ...bizData, 
-      role: "owner",
-      isExpired,
-      statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
-    });
+      results.push({ 
+        id: doc.id, 
+        ...bizData, 
+        role: "owner",
+        isExpired,
+        statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
+      });
+    }
+  } catch (err) {
+    console.error("[Discovery] Owned business fetch failed:", err.message);
   }
 
-  // 2. Staff businesses (Optimized Query)
+  // 2. Staff businesses (Optimized Query - Safe from index errors)
   if (userMobile) {
-    const cleanLogged = userMobile.replace(/\D/g, "").slice(-10);
-    const staffSnap = await db.collectionGroup("staff")
-      .where("cleanMobile", "==", cleanLogged)
-      .get();
+    try {
+      const cleanLogged = userMobile.replace(/\D/g, "").slice(-10);
+      const staffSnap = await db.collectionGroup("staff")
+        .where("cleanMobile", "==", cleanLogged)
+        .get();
 
-    for (const staffDoc of staffSnap.docs) {
-      const bizRef = staffDoc.ref.parent.parent;
-      const bizSnap = await bizRef.get();
-      if (bizSnap.exists) {
-        const ownerId = bizRef.parent.parent.id;
-        const bizData = bizSnap.data();
-        const isExpired = bizData.expiryDate ? bizData.expiryDate.toDate() < new Date() : true;
+      for (const staffDoc of staffSnap.docs) {
+        const bizRef = staffDoc.ref.parent.parent;
+        const bizSnap = await bizRef.get();
+        if (bizSnap.exists) {
+          const bizData = bizSnap.data();
+          let isExpired = true;
+          try {
+            if (bizData.expiryDate) {
+              const exp = bizData.expiryDate.toDate ? bizData.expiryDate.toDate() : new Date(bizData.expiryDate);
+              isExpired = exp < new Date();
+            }
+          } catch (e) {}
 
-        results.push({ 
-          id: bizSnap.id, 
-          ...bizData, 
-          role: staffDoc.data().role || "staff",
-          isExpired,
-          statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
-        });
+          results.push({ 
+            id: bizSnap.id, 
+            ...bizData, 
+            role: staffDoc.data().role || "staff",
+            isExpired,
+            statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
+          });
+        }
       }
+    } catch (err) {
+      console.error("[Discovery] Staff query failed (likely missing index):", err.message);
+      // We don't throw here so owned businesses can still show
     }
   }
 
