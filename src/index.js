@@ -6,20 +6,33 @@ import { authMiddleware } from "./middleware/auth.js";
 import { getDateRange } from "./helpers/dateRange.js";
 import { format } from "date-fns";
 import ImageKit from "imagekit";
-
-const imagekit = new ImageKit({
-  publicKey: process.env.IMAGEKIT_PUBLIC_KEY || "your_public_key",
-  privateKey: process.env.IMAGEKIT_PRIVATE_KEY || "your_private_key",
-  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || "https://ik.imagekit.io/your_imagekit_id"
-});
+import NodeCache from "node-cache";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Initialize ImageKit
+const imagekit = new ImageKit({
+  publicKey: process.env.IMAGEKIT_PUBLIC_KEY || "your_public_key",
+  privateKey: process.env.IMAGEKIT_PRIVATE_KEY || "your_private_key",
+  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || "https://ik.imagekit.io/your_imagekit_id"
+});
+
+// Initialize Cache (Path cache: 5 mins, Data cache: 1 hour)
+const apiCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+
 app.use(cors());
 app.use(express.json());
+
+// Cache Helpers
+const getCacheKey = (type, bizId) => `${type}_${bizId}`;
+const clearBizCache = (bizId) => {
+  apiCache.del(getCacheKey("items", bizId));
+  apiCache.del(getCacheKey("categories", bizId));
+  console.log(`[Cache] Cleared data for business: ${bizId}`);
+};
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -30,89 +43,124 @@ app.use(express.json());
  *  Owners:  users/{ownerId}/businesses/{businessId}
  *  Staff :  same path but the ownerId is stored in the business doc
  */
-/** Resolve the Firestore path for a business. */
+/** 
+ * Resolve the Firestore path for a business and check subscription status. 
+ * Returns { ownerId, businessId } or throws an error if inactive/expired.
+ */
 async function resolveBusinessPath(userId, userMobile, businessId) {
+  const cacheKey = `path_${userId}_${businessId}`;
+  const cached = apiCache.get(cacheKey);
+  
+  const now = new Date();
+
+  // If cached, verify the subscription status before returning
+  if (cached) {
+    const { ownerId, status, expiryDate } = cached;
+    const expiry = expiryDate ? new Date(expiryDate) : null;
+
+    if (status !== "active") {
+      throw new Error("Business access is disabled. Please contact the owner or administrator.");
+    }
+    if (!expiry || expiry < now) {
+      throw new Error("Business subscription has expired. Access locked.");
+    }
+    return { ownerId, businessId };
+  }
+
+  let foundBiz = null;
+  let ownerId = userId;
+
   // 1. Check if user owns it
   const ownerRef = db.doc(`users/${userId}/businesses/${businessId}`);
   const ownerSnap = await ownerRef.get();
-  if (ownerSnap.exists) return { ownerId: userId, businessId };
+  
+  if (ownerSnap.exists) {
+    foundBiz = ownerSnap.data();
+  } else if (userMobile) {
+    // 2. Optimized Search (Fast)
+    const cleanLogged = userMobile.replace(/\D/g, "").slice(-10);
+    const staffSnap = await db.collectionGroup("staff")
+      .where("cleanMobile", "==", cleanLogged)
+      .where("businessId", "==", businessId)
+      .limit(1)
+      .get();
 
-  // 2. Check if user is a staff member by mobile number (flexible)
-  if (!userMobile) return null;
-  const cleanLogged = userMobile.replace(/\D/g, "");
-  const last10 = cleanLogged.slice(-10);
-
-  // Search all staff records in the system
-  const staffSnap = await db.collectionGroup("staff").get();
-  for (const staffDoc of staffSnap.docs) {
-    const sData = staffDoc.data();
-    const sMobile = (sData.mobileNumber || "").replace(/\D/g, "");
-    
-    // Check if both businessId and mobile number match
-    if (sData.businessId === businessId && sMobile.endsWith(last10)) {
-      const ownerId = staffDoc.ref.parent.parent.parent.parent.id;
-      return { ownerId, businessId };
+    if (!staffSnap.empty) {
+      const staffDoc = staffSnap.docs[0];
+      ownerId = staffDoc.ref.parent.parent.parent.parent.id;
+      const bizRef = staffDoc.ref.parent.parent;
+      const bizSnap = await bizRef.get();
+      if (bizSnap.exists) foundBiz = bizSnap.data();
     }
   }
 
-  return null;
+  if (!foundBiz) return null;
+
+  // 3. STRICT SECURITY CHECK
+  const expiry = foundBiz.expiryDate ? foundBiz.expiryDate.toDate() : null;
+
+  if (foundBiz.status !== "active") {
+    throw new Error("Business access is disabled. Please contact the owner or administrator.");
+  }
+
+  if (!expiry || expiry < now) {
+    throw new Error("Business subscription has expired. Access locked.");
+  }
+
+  const result = { 
+    ownerId, 
+    businessId, 
+    status: foundBiz.status, 
+    expiryDate: expiry ? expiry.toISOString() : null 
+  };
+  
+  // Cache for 5 minutes
+  apiCache.set(cacheKey, result, 300);
+  return { ownerId, businessId };
 }
 
 /** Return all businesses visible to a user (own + as staff) */
 async function getAccessibleBusinesses(userId, userMobile) {
   const results = [];
-  console.log(`[Discovery] Checking businesses for User: ${userId}, Mobile: ${userMobile}`);
 
   // 1. Own businesses
   const ownSnap = await db.collection(`users/${userId}/businesses`).get();
-  console.log(`[Discovery] Found ${ownSnap.size} owned businesses`);
-  
   for (const doc of ownSnap.docs) {
     const bizData = doc.data();
-    const staffSnap = await db.collection(`users/${userId}/businesses/${doc.id}/staff`).get();
-    const staffList = [];
-    staffSnap.forEach(s => staffList.push({ id: s.id, ...s.data() }));
+    // Check expiry for UI label
+    const isExpired = bizData.expiryDate ? bizData.expiryDate.toDate() < new Date() : true;
 
     results.push({ 
       id: doc.id, 
       ...bizData, 
       role: "owner",
-      staffList
+      isExpired,
+      statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
     });
   }
 
-  // 2. Businesses where user is staff by mobile number
+  // 2. Staff businesses (Optimized Query)
   if (userMobile) {
-    // Extract last 10 digits to be safe from +91 or other prefix issues
-    const cleanMobile = userMobile.replace(/\D/g, "");
-    const last10 = cleanMobile.slice(-10);
-    
-    console.log(`[Discovery] Searching for staff entries matching last 10 digits: ${last10}`);
-
-    const staffSnap = await db.collectionGroup("staff").get();
-    console.log(`[Discovery] Total staff records in system: ${staffSnap.size}`);
+    const cleanLogged = userMobile.replace(/\D/g, "").slice(-10);
+    const staffSnap = await db.collectionGroup("staff")
+      .where("cleanMobile", "==", cleanLogged)
+      .get();
 
     for (const staffDoc of staffSnap.docs) {
-      const sData = staffDoc.data();
-      const sMobile = (sData.mobileNumber || "").replace(/\D/g, "");
-      
-      // If the last 10 digits match, treat as the same person
-      if (sMobile.endsWith(last10)) {
-        const bizRef = staffDoc.ref.parent.parent;
-        const bizSnap = await bizRef.get();
-        
-        if (bizSnap.exists) {
-          console.log(`[Discovery] Found staff Match! Business: ${bizSnap.data().name}`);
-          const ownerId = bizRef.parent.parent.id;
-          const ownerSnap = await db.doc(`users/${ownerId}`).get();
-          
-          results.push({ 
-            id: bizSnap.id, 
-            ...bizSnap.data(), 
-            role: sData.role || "staff",
-            ownerMobile: ownerSnap.exists ? ownerSnap.data().phoneNumber : null
-          });
-        }
+      const bizRef = staffDoc.ref.parent.parent;
+      const bizSnap = await bizRef.get();
+      if (bizSnap.exists) {
+        const ownerId = bizRef.parent.parent.id;
+        const bizData = bizSnap.data();
+        const isExpired = bizData.expiryDate ? bizData.expiryDate.toDate() < new Date() : true;
+
+        results.push({ 
+          id: bizSnap.id, 
+          ...bizData, 
+          role: staffDoc.data().role || "staff",
+          isExpired,
+          statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
+        });
       }
     }
   }
@@ -134,20 +182,29 @@ app.post("/api/business", authMiddleware, async (req, res) => {
     if (!name) return res.status(400).json({ error: "Business name is required" });
 
     const userId = req.user.userId;
-    const userMobile = req.user.phoneNumber;
+    const userMobile = req.user.phoneNumber || req.user.phone;
+
+    // Set expiry to yesterday (makes it expired by default)
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
 
     const businessRef = db.collection(`users/${userId}/businesses`);
     const newBusiness = await businessRef.add({
       name,
       ownerId: userId,
       ownerMobile: userMobile,
+      status: "active",       // Allow them to see the landing, but expired
+      expiryDate: yesterday, // Expired by default
       createdAt: FieldValue.serverTimestamp()
     });
 
-    // Also update user profile with phone if not there
-    await db.doc(`users/${userId}`).set({ phoneNumber: userMobile }, { merge: true });
-
-    res.status(201).json({ id: newBusiness.id, name, role: "owner", message: "Business created" });
+    res.status(201).json({ 
+      id: newBusiness.id, 
+      name, 
+      role: "owner", 
+      status: "active", 
+      message: "Business created. Please renew subscription to start billing." 
+    });
   } catch (err) {
     console.error("Error creating business:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
@@ -197,15 +254,19 @@ app.post("/api/staff", authMiddleware, async (req, res) => {
     }
 
     const staffRef = db.collection(`users/${userId}/businesses/${businessId}/staff`);
+    
+    // SPEED OPTIMIZATION: Clean mobile for indexing
+    const cleanMobile = mobileNumber.replace(/\D/g, "").slice(-10);
 
     // Check if duplicate mobile in this business
-    const existing = await staffRef.where("mobileNumber", "==", mobileNumber).limit(1).get();
+    const existing = await staffRef.where("cleanMobile", "==", cleanMobile).limit(1).get();
     if (!existing.empty) {
       return res.status(409).json({ error: "This mobile number is already added as staff" });
     }
 
     const newStaff = await staffRef.add({
       mobileNumber,
+      cleanMobile, // Store cleaned version for fast queries
       name,
       businessId,
       role,
@@ -241,6 +302,9 @@ app.get("/api/staff", authMiddleware, async (req, res) => {
 
     res.status(200).json(staff);
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     console.error("Error fetching staff:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
@@ -266,6 +330,9 @@ app.delete("/api/staff/:staffId", authMiddleware, async (req, res) => {
     await db.doc(`users/${userId}/businesses/${businessId}/staff/${staffId}`).delete();
     res.status(200).json({ message: "Staff member removed" });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     console.error("Error removing staff:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
@@ -286,10 +353,15 @@ app.post("/api/category", authMiddleware, async (req, res) => {
     const path = await resolveBusinessPath(userId, userMobile, businessId);
     if (!path) return res.status(403).json({ error: "Not authorised" });
 
+    apiCache.del(getCacheKey("categories", businessId)); // Clear cache
+
     const ref = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`);
     const doc = await ref.add({ name, createdAt: FieldValue.serverTimestamp() });
     res.status(201).json({ id: doc.id, message: "Category created" });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -304,11 +376,20 @@ app.get("/api/categories", authMiddleware, async (req, res) => {
     const path = await resolveBusinessPath(userId, userMobile, businessId);
     if (!path) return res.status(403).json({ error: "Not authorised" });
 
+    const cacheKey = getCacheKey("categories", businessId);
+    const cached = apiCache.get(cacheKey);
+    if (cached) return res.status(200).json(cached);
+
     const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`).get();
     const data = [];
     snap.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
+    
+    apiCache.set(cacheKey, data); // Store in cache
     res.status(200).json(data);
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -330,6 +411,8 @@ app.post("/api/item", authMiddleware, async (req, res) => {
 
     const path = await resolveBusinessPath(userId, userMobile, businessId);
     if (!path) return res.status(403).json({ error: "Not authorised" });
+
+    apiCache.del(getCacheKey("items", businessId)); // Clear cache
 
     let finalImageUrl = imageUrl || null;
 
@@ -356,6 +439,9 @@ app.post("/api/item", authMiddleware, async (req, res) => {
     });
     res.status(201).json({ id: doc.id, message: "Item created", imageUrl: finalImageUrl });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -370,11 +456,20 @@ app.get("/api/items", authMiddleware, async (req, res) => {
     const path = await resolveBusinessPath(userId, userMobile, businessId);
     if (!path) return res.status(403).json({ error: "Not authorised" });
 
+    const cacheKey = getCacheKey("items", businessId);
+    const cached = apiCache.get(cacheKey);
+    if (cached) return res.status(200).json(cached);
+
     const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`).get();
     const data = [];
     snap.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
+    
+    apiCache.set(cacheKey, data); // Store in cache
     res.status(200).json(data);
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -408,6 +503,9 @@ app.post("/api/bill", authMiddleware, async (req, res) => {
     });
     res.status(201).json({ id: doc.id, message: "Bill created" });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -445,6 +543,9 @@ app.get("/api/bills", authMiddleware, async (req, res) => {
 
     res.status(200).json(bills);
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -485,6 +586,9 @@ app.post("/api/investment", authMiddleware, async (req, res) => {
 
     res.status(201).json({ id: doc.id, message: "Investment recorded" });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -531,6 +635,9 @@ app.get("/api/investments", authMiddleware, async (req, res) => {
       investments
     });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -552,6 +659,9 @@ app.delete("/api/investment/:id", authMiddleware, async (req, res) => {
     await db.doc(`users/${path.ownerId}/businesses/${path.businessId}/investments/${id}`).delete();
     res.status(200).json({ message: "Investment deleted" });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
 });
@@ -723,6 +833,9 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
     });
 
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     console.error("Error fetching dashboard:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
@@ -815,6 +928,9 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
       bills: bills.slice(0, 200)
     });
   } catch (err) {
+    if (err.message.includes("expired") || err.message.includes("disabled")) {
+      return res.status(403).json({ error: "Access Denied", message: err.message });
+    }
     console.error("Error fetching reports:", err);
     res.status(500).json({ error: "Internal server error", message: err.message });
   }
