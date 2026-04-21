@@ -20,8 +20,8 @@ const imagekit = new ImageKit({
   urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || "https://ik.imagekit.io/your_imagekit_id"
 });
 
-// Initialize Cache (Path cache: 5 mins, Data cache: 1 hour)
-const apiCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+// Initialize Cache (Path cache: 5 mins, Data cache: 5 mins)
+const apiCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 
 app.use(cors());
 app.use(express.json());
@@ -31,6 +31,11 @@ const getCacheKey = (type, bizId) => `${type}_${bizId}`;
 const clearBizCache = (bizId) => {
   apiCache.del(getCacheKey("items", bizId));
   apiCache.del(getCacheKey("categories", bizId));
+  // Clear all dashboard variations for this business
+  const keys = apiCache.keys();
+  keys.forEach(k => {
+    if (k.includes(`dashboard_${bizId}`)) apiCache.del(k);
+  });
   console.log(`[Cache] Cleared data for business: ${bizId}`);
 };
 
@@ -539,7 +544,7 @@ app.get("/api/items", authMiddleware, async (req, res) => {
 
 app.post("/api/bill", authMiddleware, async (req, res) => {
   try {
-    const { businessId, items, total, discount = 0, tax = 0, paymentMode = "Cash", paymentMethod } = req.body;
+    const { businessId, items, total, subtotal, gstAmount, gstRate, discount = 0, paymentMode = "Cash", paymentMethod } = req.body;
     const userId = req.user.userId;
     const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
 
@@ -554,11 +559,16 @@ app.post("/api/bill", authMiddleware, async (req, res) => {
     const doc = await ref.add({
       items,
       total: parseFloat(total),
+      subtotal: parseFloat(subtotal || total),
+      gstAmount: parseFloat(gstAmount || 0),
+      gstRate: parseFloat(gstRate || 0),
       discount: parseFloat(discount),
-      tax: parseFloat(tax),
       paymentMode: paymentMode !== "Cash" ? paymentMode : (paymentMethod || "Cash"),
       createdAt: FieldValue.serverTimestamp()
     });
+    
+    clearBizCache(businessId);
+    
     res.status(201).json({ id: doc.id, message: "Bill created" });
   } catch (err) {
     if (err.message.includes("expired") || err.message.includes("disabled")) {
@@ -780,6 +790,7 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
     // ── Aggregate Bills ──────────────────────────────────────────
     let totalRevenue = 0;
     let totalBills = 0;
+    let totalGst = 0;
     const paymentModes = { Cash: 0, UPI: 0, Card: 0 };
     const itemSales = {};          // { itemName: { qty, revenue } }
     const dailyRevMap = {};        // { "2024-04-20": number }
@@ -790,8 +801,10 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
       const d = doc.data();
       const billDate = d.createdAt ? d.createdAt.toDate() : new Date();
       const amt = d.total || 0;
+      const gst = d.gstAmount || 0;
 
       totalRevenue += amt;
+      totalGst += gst;
       totalBills++;
 
       const pMode = d.paymentMode || "Cash";
@@ -874,6 +887,7 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
         isProfit,
         profitLossPct: parseFloat(profitLossPct.toFixed(2)),
         totalBills,
+        totalGst,
         avgOrderValue: totalBills > 0 ? parseFloat((totalRevenue / totalBills).toFixed(2)) : 0,
         paymentModes
       },
