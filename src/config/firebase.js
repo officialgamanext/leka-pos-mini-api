@@ -18,12 +18,18 @@ if (!admin.apps.length) {
 
     // 1. Check for individual environment variables (Best for Vercel/Production)
     if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+      // Deep Clean: Handle both literal \n and actual newlines
+      const rawKey = process.env.FIREBASE_PRIVATE_KEY;
+      const formattedKey = rawKey
+        .replace(/^["']|["']$/g, '') // Remove quotes
+        .replace(/\\n/g, '\n');      // Fix escaped newlines
+      
       serviceAccount = {
         projectId: process.env.FIREBASE_PROJECT_ID,
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+        privateKey: formattedKey
       };
-      console.log("🛠️ Using individual Firebase Env Vars");
+      console.log("🛠️ Using individual Firebase Env Vars (Concentrated Fix)");
     } 
     // 2. Fallback to full JSON string
     else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
