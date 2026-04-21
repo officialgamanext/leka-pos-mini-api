@@ -14,28 +14,26 @@ let db;
 
 if (!admin.apps.length) {
   try {
-    const certPath = path.resolve(__dirname, "../../service-account.json");
-    const rawData = fs.readFileSync(certPath, "utf8");
-    const serviceAccount = JSON.parse(rawData);
+    let serviceAccount;
 
+    // Use environment variable if available (Recommended for Vercel)
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    } else {
+      // Fallback for local development
+      const certPath = path.resolve(__dirname, "../../service-account.json");
+      if (fs.existsSync(certPath)) {
+        serviceAccount = JSON.parse(fs.readFileSync(certPath, "utf8"));
+      }
+    }
+
+    if (!serviceAccount) {
+      throw new Error("Firebase Service Account configuration missing.");
+    }
+
+    // Fix private key formatting for Vercel
     if (serviceAccount.private_key) {
-      // THE FIX: 
-      // 1. Remove ALL types of white space and literal backslash-n sequences
-      let cleanKey = serviceAccount.private_key
-        .replace(/\\n/g, '')  // remove literal \n
-        .replace(/\n/g, '')    // remove actual newlines
-        .replace(/\s+/g, '');  // remove all spaces/tabs
-
-      // 2. Extract the base64 part between the headers
-      const header = "-----BEGIN PRIVATE KEY-----";
-      const footer = "-----END PRIVATE KEY-----";
-      
-      const base64Body = cleanKey
-        .replace(header.replace(/\s+/g, ''), '')
-        .replace(footer.replace(/\s+/g, ''), '');
-
-      // 3. Reconstruct with exactly one newline after header and before footer
-      serviceAccount.private_key = `${header}\n${base64Body}\n${footer}\n`;
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
     }
 
     admin.initializeApp({
@@ -45,9 +43,11 @@ if (!admin.apps.length) {
     db = getFirestore();
     console.log("✅ Firebase Admin & Firestore initialized successfully.");
   } catch (error) {
-    console.error("❌ Failed to initialize Firebase Admin:", error.message);
-    // Exit the process so nodemon can wait for your fix
-    process.exit(1); 
+    console.error("❌ Firebase Init Error:", error.message);
+    // Don't process.exit(1) on Vercel, as it causes a loop. 
+    // Instead, we throw it so Vercel can log it properly.
+    if (process.env.NODE_ENV === "production") throw error;
+    process.exit(1);
   }
 } else {
   db = getFirestore();
