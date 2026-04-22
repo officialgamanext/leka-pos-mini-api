@@ -1,8 +1,12 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import hpp from "hpp";
 import dotenv from "dotenv";
 import { db, FieldValue } from "./config/firebase.js";
 import { authMiddleware } from "./middleware/auth.js";
+import { businessRules, staffRules, itemRules, billRules, validate } from "./middleware/validation.js";
 import { getDateRange } from "./helpers/dateRange.js";
 import { format } from "date-fns";
 import ImageKit from "imagekit";
@@ -13,22 +17,72 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust proxy (crucial for rate limiting behind Vercel/Proxies)
+app.set("trust proxy", 1);
+
+// 1. Security Headers (Helmet)
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      imgSrc: ["'self'", "data:", "https://ik.imagekit.io"],
+      connectSrc: ["'self'", "https://*.descope.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: [],
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+}));
+
+// 2. Rate Limiting
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later." }
+});
+app.use("/api/", globalLimiter);
+
+// 3. CORS Configuration
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(",") 
+  : ["http://localhost:3000", "http://localhost:5173"];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV !== "production") {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  methods: ["GET", "POST", "PATCH", "DELETE", "PUT", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
+  credentials: true
+}));
+
+// 4. Payload Size Limits & JSON Parsing
+app.use(express.json({ limit: "10kb" })); // Defend against large JSON payloads
+app.use(express.urlencoded({ extended: true, limit: "10kb" }));
+
+// 5. HTTP Parameter Pollution Protection
+app.use(hpp());
+
 // Initialize ImageKit
 const imagekit = new ImageKit({
-  publicKey: process.env.IMAGEKIT_PUBLIC_KEY || "your_public_key",
-  privateKey: process.env.IMAGEKIT_PRIVATE_KEY || "your_private_key",
-  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT || "https://ik.imagekit.io/your_imagekit_id"
+  publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+  privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT
 });
 
 // Initialize Cache (Path cache: 5 mins, Data cache: 5 mins)
 const apiCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
-
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "PATCH", "DELETE", "PUT", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"]
-}));
-app.use(express.json());
 
 // Cache Helpers
 const getCacheKey = (type, bizId) => `${type}_${bizId}`;
@@ -163,36 +217,55 @@ async function getAccessibleBusinesses(userId, userMobile) {
   if (userMobile) {
     try {
       const cleanLogged = userMobile.replace(/\D/g, "").slice(-10);
+      console.log(`[Discovery] Querying staff for mobile suffix: ${cleanLogged}`);
+      
       const staffSnap = await db.collectionGroup("staff")
         .where("cleanMobile", "==", cleanLogged)
+        .orderBy("name")
         .get();
 
+      console.log(`[Discovery] Found ${staffSnap.size} staff records for ${cleanLogged}`);
+
       for (const staffDoc of staffSnap.docs) {
+        const staffData = staffDoc.data();
+        console.log(`[Discovery] Processing staff record:`, staffData);
+        
         const bizRef = staffDoc.ref.parent.parent;
         const bizSnap = await bizRef.get();
+        
         if (bizSnap.exists) {
           const bizData = bizSnap.data();
+          console.log(`[Discovery] Business found for staff: ${bizData.name}`);
+          
           let isExpired = true;
           try {
             if (bizData.expiryDate) {
               const exp = bizData.expiryDate.toDate ? bizData.expiryDate.toDate() : new Date(bizData.expiryDate);
               isExpired = exp < new Date();
             }
-          } catch (e) {}
+          } catch (e) {
+            console.error(`[Discovery] Error parsing expiry for ${bizSnap.id}:`, e.message);
+          }
 
           results.push({ 
             id: bizSnap.id, 
             ...bizData, 
-            role: staffDoc.data().role || "staff",
+            role: staffData.role || "staff",
             isExpired,
             statusLabel: bizData.status === "active" ? (isExpired ? "Expired" : "Active") : "Inactive"
           });
+        } else {
+          console.warn(`[Discovery] Staff record found but business doc missing: ${staffDoc.id}`);
         }
       }
     } catch (err) {
-      console.error("[Discovery] Staff query failed (likely missing index):", err.message);
-      // We don't throw here so owned businesses can still show
+      console.error("[Discovery] Staff query failed:", err.message);
+      if (err.message.includes("index")) {
+        console.error("[SECURITY/CONFIG] Missing Firestore index for collectionGroup('staff'). Please check Firebase Console.");
+      }
     }
+  } else {
+    console.warn("[Discovery] No userMobile found for staff discovery.");
   }
 
   return results;
@@ -206,7 +279,7 @@ async function getAccessibleBusinesses(userId, userMobile) {
 /**
  * POST /api/business  — Create a Business (owner)
  */
-app.post("/api/business", authMiddleware, async (req, res) => {
+app.post("/api/business", authMiddleware, businessRules, validate, async (req, res) => {
   try {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "Business name is required" });
@@ -304,7 +377,7 @@ app.patch("/api/business/:businessId", authMiddleware, async (req, res) => {
  * POST /api/staff  — Add a staff member by Mobile Number
  * Body: { businessId, mobileNumber, name, role }
  */
-app.post("/api/staff", authMiddleware, async (req, res) => {
+app.post("/api/staff", authMiddleware, staffRules, validate, async (req, res) => {
   try {
     const { businessId, mobileNumber, name, role = "staff" } = req.body;
     const userId = req.user.userId;
@@ -466,7 +539,7 @@ app.get("/api/categories", authMiddleware, async (req, res) => {
 //  ITEMS
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.post("/api/item", authMiddleware, async (req, res) => {
+app.post("/api/item", authMiddleware, itemRules, validate, async (req, res) => {
   try {
     const { businessId, name, price, categoryId, imageUrl } = req.body;
     const userId = req.user.userId;
@@ -546,7 +619,7 @@ app.get("/api/items", authMiddleware, async (req, res) => {
 //  BILLS
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.post("/api/bill", authMiddleware, async (req, res) => {
+app.post("/api/bill", authMiddleware, billRules, validate, async (req, res) => {
   try {
     const { businessId, items, total, subtotal, gstAmount, gstRate, discount = 0, paymentMode = "Cash", paymentMethod } = req.body;
     const userId = req.user.userId;
@@ -1017,10 +1090,25 @@ app.get("/api/reports", authMiddleware, async (req, res) => {
 //  ADMIN AREA (Super Admin)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Simple development admin bypass or secret key check
+/**
+ * Strict Admin Authentication Middleware
+ * Checks for a robust secret key in the x-admin-secret header.
+ */
 const adminAuth = (req, res, next) => {
-  // TEMPORARILY DISABLED FOR DEBUGGING
-  return next();
+  const secret = req.headers["x-admin-secret"];
+  const expectedSecret = process.env.ADMIN_SECRET_KEY;
+
+  if (!expectedSecret || expectedSecret.length < 32) {
+    console.error("[CRITICAL] ADMIN_SECRET_KEY is missing or too weak!");
+    return res.status(500).json({ error: "Server configuration error" });
+  }
+
+  if (!secret || secret !== expectedSecret) {
+    console.warn(`[SECURITY] Unauthorized admin access attempt from IP: ${req.ip}`);
+    return res.status(403).json({ error: "Access denied. Invalid admin secret." });
+  }
+
+  next();
 };
 
 app.get("/api/admin/discover", adminAuth, async (req, res) => {
@@ -1258,7 +1346,20 @@ app.get("/api/admin/all-staff", adminAuth, async (req, res) => {
 //  HEALTH
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.get("/health", (_, res) => res.send("OK"));
+// Global Error Handler (Hides stack traces in production)
+app.use((err, req, res, next) => {
+  console.error(`[Error] ${err.stack}`);
+  
+  const status = err.status || 500;
+  const message = process.env.NODE_ENV === "production" 
+    ? "An internal server error occurred" 
+    : err.message;
+
+  res.status(status).json({ 
+    error: status === 500 ? "Internal Server Error" : "Error",
+    message 
+  });
+});
 
 export default app;
 

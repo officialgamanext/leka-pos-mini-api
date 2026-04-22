@@ -41,6 +41,7 @@ export const authMiddleware = async (req, res, next) => {
       phoneNumber,
       ...authInfo.token
     };
+    console.log(`[Auth] User authenticated: ${userId}, Phone: ${phoneNumber}`);
     
     next();
   } catch (error) {
