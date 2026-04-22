@@ -142,14 +142,16 @@ async function resolveBusinessPath(userId, userMobile, businessId) {
   } else if (userMobile) {
     // 2. Optimized Search (Fast)
     const cleanLogged = userMobile.replace(/\D/g, "").slice(-10);
+    // Use the indexed query (cleanMobile + name) to find staff records
     const staffSnap = await db.collectionGroup("staff")
       .where("cleanMobile", "==", cleanLogged)
-      .where("businessId", "==", businessId)
-      .limit(1)
+      .orderBy("name")
       .get();
 
-    if (!staffSnap.empty) {
-      const staffDoc = staffSnap.docs[0];
+    // Check if any of the staff records match this businessId
+    const staffDoc = staffSnap.docs.find(d => d.data().businessId === businessId);
+
+    if (staffDoc) {
       ownerId = staffDoc.ref.parent.parent.parent.parent.id;
       const bizRef = staffDoc.ref.parent.parent;
       const bizSnap = await bizRef.get();
