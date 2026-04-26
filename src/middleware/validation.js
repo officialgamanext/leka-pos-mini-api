@@ -49,3 +49,4 @@ export const billRules = [
   body("items.*.quantity").isFloat({ min: 0.001 }).withMessage("Item quantity must be positive"),
   body("total").isFloat({ min: 0 }).withMessage("Total must be a positive number"),
 ];
+
