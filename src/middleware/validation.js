@@ -46,6 +46,6 @@ export const billRules = [
   body("items").isArray({ min: 1 }).withMessage("Items must be an array with at least one item"),
   body("items.*.name").trim().notEmpty().withMessage("Item name is required"),
   body("items.*.price").isFloat({ min: 0 }).withMessage("Item price must be positive"),
-  body("items.*.quantity").isInt({ min: 1 }).withMessage("Item quantity must be at least 1"),
+  body("items.*.quantity").isFloat({ min: 0.001 }).withMessage("Item quantity must be positive"),
   body("total").isFloat({ min: 0 }).withMessage("Total must be a positive number"),
 ];

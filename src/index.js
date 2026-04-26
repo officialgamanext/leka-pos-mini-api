@@ -68,8 +68,8 @@ app.use(cors({
 }));
 
 // 4. Payload Size Limits & JSON Parsing
-app.use(express.json({ limit: "10kb" })); // Defend against large JSON payloads
-app.use(express.urlencoded({ extended: true, limit: "10kb" }));
+app.use(express.json({ limit: "2mb" })); // Increased to 2mb for base64 images
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 // 5. HTTP Parameter Pollution Protection
 app.use(hpp());
@@ -543,7 +543,7 @@ app.get("/api/categories", authMiddleware, async (req, res) => {
 
 app.post("/api/item", authMiddleware, itemRules, validate, async (req, res) => {
   try {
-    const { businessId, name, price, categoryId, imageUrl } = req.body;
+    const { businessId, name, price, categoryId, imageUrl, unitType = 'FIXED', unitName = 'pcs' } = req.body;
     const userId = req.user.userId;
     const userMobile = req.user.phoneNumber || req.user.phone || req.user.phone_number;
 
@@ -577,6 +577,8 @@ app.post("/api/item", authMiddleware, itemRules, validate, async (req, res) => {
       price: parseFloat(price),
       categoryId: categoryId || null,
       imageUrl: finalImageUrl,
+      unitType,
+      unitName,
       createdAt: FieldValue.serverTimestamp()
     });
     res.status(201).json({ id: doc.id, message: "Item created", imageUrl: finalImageUrl });
