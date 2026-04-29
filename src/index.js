@@ -355,6 +355,26 @@ app.patch("/api/business/:businessId", authMiddleware, async (req, res) => {
     if (gstEnabled !== undefined) updates.gstEnabled = gstEnabled;
     if (gstPercentage !== undefined) updates.gstPercentage = Number(gstPercentage);
     
+    if (req.body.logoUrl !== undefined) {
+      const { logoUrl } = req.body;
+      if (logoUrl === null || logoUrl === "") {
+        updates.logoUrl = null;
+      } else if (logoUrl.startsWith("data:image")) {
+        try {
+          const uploadResult = await imagekit.upload({
+            file: logoUrl, 
+            fileName: `logo_${Date.now()}.jpg`,
+            folder: "/leka-pos-mini"
+          });
+          updates.logoUrl = uploadResult.url; 
+        } catch (uploadErr) {
+          console.error("ImageKit Upload Error:", uploadErr);
+        }
+      } else {
+        updates.logoUrl = logoUrl;
+      }
+    }
+
     updates.updatedAt = FieldValue.serverTimestamp();
 
     await bizRef.update(updates);
