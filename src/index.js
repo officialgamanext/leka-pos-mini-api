@@ -515,7 +515,7 @@ app.post("/api/category", authMiddleware, async (req, res) => {
     const path = await resolveBusinessPath(userId, userMobile, businessId);
     if (!path) return res.status(403).json({ error: "Not authorised" });
 
-    apiCache.del(getCacheKey("categories", businessId)); // Clear cache
+    clearBizCache(businessId);
 
     const ref = db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`);
     const doc = await ref.add({ name, createdAt: FieldValue.serverTimestamp() });
@@ -542,7 +542,9 @@ app.get("/api/categories", authMiddleware, async (req, res) => {
     const cached = apiCache.get(cacheKey);
     if (cached) return res.status(200).json(cached);
 
-    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`).get();
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/categories`)
+      .orderBy("createdAt", "desc")
+      .get();
     const data = [];
     snap.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
     
@@ -574,7 +576,7 @@ app.post("/api/item", authMiddleware, itemRules, validate, async (req, res) => {
     const path = await resolveBusinessPath(userId, userMobile, businessId);
     if (!path) return res.status(403).json({ error: "Not authorised" });
 
-    apiCache.del(getCacheKey("items", businessId)); // Clear cache
+    clearBizCache(businessId);
 
     let finalImageUrl = imageUrl || null;
 
@@ -624,7 +626,9 @@ app.get("/api/items", authMiddleware, async (req, res) => {
     const cached = apiCache.get(cacheKey);
     if (cached) return res.status(200).json(cached);
 
-    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`).get();
+    const snap = await db.collection(`users/${path.ownerId}/businesses/${path.businessId}/items`)
+      .orderBy("createdAt", "desc")
+      .get();
     const data = [];
     snap.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
     
